@@ -156,7 +156,7 @@ public class FinanceApp extends Application {
 
             disableDefaultDemoAccount(c);
             return true;
-        } catch (SQLException e) { LOG.severe(e.getMessage()); return false; }
+        } catch (SQLException | java.security.GeneralSecurityException e) { LOG.severe(e.getMessage()); return false; }
     }
 
     // ══════════════════════════════════════════════════════════════════════════
