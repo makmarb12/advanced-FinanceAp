@@ -1,4 +1,16 @@
 /build/
+/dist/
+/target/
 nbproject/private/
-*~
 *.class
+*.log
+*~
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+# Keep local database-driver JARs and credentials out of the repository.
+*.jar
+.env
+.env.*
+!.env.example
