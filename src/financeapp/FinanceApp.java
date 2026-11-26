@@ -29,12 +29,12 @@ import java.util.logging.*;
 public class FinanceApp extends Application {
 
     // ── Database ──────────────────────────────────────────────────────────────
-    private static final String DB_HOST  = "jdbc:mysql://localhost:3306/";
+    private static final String DB_HOST  = "jdbc:mysql://" + System.getenv().getOrDefault("FINANCE_DB_HOST", "localhost") + ":3306/";
     private static final String DB_NAME  = "finance_pro_db";
     private static final String DB_URL   = DB_HOST + DB_NAME
-            + "?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true";
-    private static final String DB_USER  = "root";
-    private static final String DB_PASS  = "";          // ← set your password
+            + "?useSSL=true&serverTimezone=UTC";
+    private static final String DB_USER  = System.getenv().getOrDefault("FINANCE_DB_USER", "finance_app");
+    private static final String DB_PASS  = System.getenv().getOrDefault("FINANCE_DB_PASSWORD", "");
 
     private static final Logger LOG = Logger.getLogger(FinanceApp.class.getName());
 
@@ -103,6 +103,10 @@ public class FinanceApp extends Application {
     //  DATABASE
     // ══════════════════════════════════════════════════════════════════════════
     private boolean initDb() {
+        if (DB_PASS.isBlank()) {
+            LOG.severe("Set FINANCE_DB_PASSWORD before starting Finance Pro.");
+            return false;
+        }
         try (Connection c = DriverManager.getConnection(DB_HOST, DB_USER, DB_PASS);
              Statement  s = c.createStatement()) {
             s.execute("CREATE DATABASE IF NOT EXISTS " + DB_NAME);
@@ -150,41 +154,9 @@ public class FinanceApp extends Application {
                     INDEX idx_bum (user_id, month_year)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""");
 
-            ResultSet rs = s.executeQuery("SELECT id FROM users WHERE username='admin'");
-            if (!rs.next()) {
-                s.executeUpdate(
-                    "INSERT INTO users (username,password,full_name) VALUES ('admin','admin123','System Administrator')");
-                rs = s.executeQuery("SELECT id FROM users WHERE username='admin'");
-                if (rs.next()) seedSampleData(s, rs.getInt("id"));
-            }
+            disableDefaultDemoAccount(c);
             return true;
-        } catch (SQLException e) { LOG.severe(e.getMessage()); return false; }
-    }
-
-    private void seedSampleData(Statement s, int uid) throws SQLException {
-        String[] rows = {
-            "('INCOME','Salary',5000.00,'Monthly salary')",
-            "('INCOME','Freelance',1200.00,'Web project')",
-            "('EXPENSE','Rent',1200.00,'Monthly rent')",
-            "('EXPENSE','Food & Dining',450.00,'Groceries')",
-            "('EXPENSE','Utilities',180.00,'Electricity bill')",
-            "('EXPENSE','Transportation',200.00,'Gas & transit')",
-            "('EXPENSE','Entertainment',150.00,'Streaming + movies')",
-            "('EXPENSE','Shopping',320.00,'Clothing')",
-            "('EXPENSE','Healthcare',90.00,'Pharmacy')"
-        };
-        for (String r : rows)
-            s.execute("INSERT INTO transactions (user_id,type,category,amount,description,transaction_date) "
-                    + "VALUES (" + uid + "," + r + ",CURDATE())");
-        // seed default budgets
-        String[] bRows = {
-            "('Food & Dining',500.00)", "('Transportation',250.00)",
-            "('Entertainment',200.00)", "('Shopping',400.00)"
-        };
-        String mon = YearMonth.now().toString();
-        for (String b : bRows)
-            s.execute("INSERT IGNORE INTO budgets (user_id,category,amount,month_year) VALUES ("
-                    + uid + "," + b + ",'" + mon + "')");
+        } catch (SQLException | java.security.GeneralSecurityException e) { LOG.severe(e.getMessage()); return false; }
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -226,9 +198,6 @@ public class FinanceApp extends Application {
                       + "-fx-padding:11px; -fx-cursor:hand;");
 
         Label lbStatus = new Label(); lbStatus.setStyle("-fx-text-fill:#ef4444; -fx-font-size:12px;");
-        Label lbDemo   = new Label("Demo: admin / admin123");
-        lbDemo.setStyle("-fx-text-fill:#cbd5e1; -fx-font-size:11px;");
-
         btnLogin.setOnAction(e -> {
             if (tfUser.getText().isBlank() || pfPass.getText().isBlank()) {
                 lbStatus.setText("Please enter username and password."); return;
@@ -240,28 +209,51 @@ public class FinanceApp extends Application {
         btnReg.setOnAction(e -> showRegister());
 
         card.getChildren().addAll(logo, sub, new Separator(),
-                                  tfUser, pfPass, btnLogin, btnReg, lbStatus, lbDemo);
+                                  tfUser, pfPass, btnLogin, btnReg, lbStatus);
         wrap.getChildren().add(card);
         return wrap;
     }
 
     private void authenticate(String user, String pass, Label lbStatus) {
         try (Connection c = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS)) {
-            PreparedStatement ps = c.prepareStatement(
-                "SELECT id,username,full_name FROM users WHERE username=? AND password=?");
-            ps.setString(1, user); ps.setString(2, pass);
-            ResultSet rs = ps.executeQuery();
-            if (rs.next()) {
-                userId   = rs.getInt("id");
-                username = rs.getString("username");
-                fullName = rs.getString("full_name");
-                Platform.runLater(() -> { buildDashboard(); loadAll(); });
-            } else {
-                Platform.runLater(() -> lbStatus.setText("Invalid username or password."));
+            int foundId;
+            String foundUsername;
+            String foundFullName;
+            String storedPassword;
+            try (PreparedStatement ps = c.prepareStatement(
+                    "SELECT id,username,full_name,password FROM users WHERE username=?")) {
+                ps.setString(1, user);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) {
+                        Platform.runLater(() -> lbStatus.setText("Invalid username or password."));
+                        return;
+                    }
+                    foundId = rs.getInt("id");
+                    foundUsername = rs.getString("username");
+                    foundFullName = rs.getString("full_name");
+                    storedPassword = rs.getString("password");
+                }
             }
-        } catch (SQLException e) {
+            if (!verifyPassword(pass, storedPassword)) {
+                Platform.runLater(() -> lbStatus.setText("Invalid username or password."));
+                return;
+            }
+            // Upgrade existing plaintext passwords after a successful legacy login.
+            if (!storedPassword.startsWith("pbkdf2_sha256$")) {
+                try (PreparedStatement upgrade = c.prepareStatement(
+                        "UPDATE users SET password=? WHERE id=?")) {
+                    upgrade.setString(1, hashPassword(pass));
+                    upgrade.setInt(2, foundId);
+                    upgrade.executeUpdate();
+                }
+            }
+            userId = foundId;
+            username = foundUsername;
+            fullName = foundFullName;
+            Platform.runLater(() -> { buildDashboard(); loadAll(); });
+        } catch (SQLException | java.security.GeneralSecurityException e) {
             LOG.severe(e.getMessage());
-            Platform.runLater(() -> lbStatus.setText("Database error. Try again."));
+            Platform.runLater(() -> lbStatus.setText("Database or security error. Try again."));
         }
     }
 
@@ -292,18 +284,85 @@ public class FinanceApp extends Application {
 
         btnReg.setOnAction(e -> {
             if (tfUser.getText().isBlank() || pfPass.getText().isBlank()) { lbStat.setText("Username & password required."); return; }
+            if (pfPass.getText().length() < 10) { lbStat.setText("Use a password with at least 10 characters."); return; }
             if (!pfPass.getText().equals(pfConf.getText())) { lbStat.setText("Passwords do not match."); return; }
             try (Connection c = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS)) {
                 PreparedStatement ps = c.prepareStatement("INSERT INTO users (username,password,full_name) VALUES (?,?,?)");
-                ps.setString(1, tfUser.getText()); ps.setString(2, pfPass.getText()); ps.setString(3, tfName.getText());
+                ps.setString(1, tfUser.getText()); ps.setString(2, hashPassword(pfPass.getText())); ps.setString(3, tfName.getText());
                 ps.executeUpdate();
                 showLogin();
-            } catch (SQLException ex) { lbStat.setText("Username already exists."); }
+            } catch (SQLException | java.security.GeneralSecurityException ex) { lbStat.setText("Registration failed. Check the username and database connection."); }
         });
         btnBack.setOnAction(e -> showLogin());
 
         card.getChildren().addAll(title, new Separator(), tfUser, tfName, pfPass, pfConf, lbMatch, btnReg, btnBack, lbStat);
         wrap.getChildren().add(card);
+    }
+
+    private static final int PASSWORD_ITERATIONS = 210_000;
+    private static final int PASSWORD_KEY_LENGTH = 256;
+    private static final java.security.SecureRandom PASSWORD_RANDOM = new java.security.SecureRandom();
+
+    private static String hashPassword(String password) throws java.security.GeneralSecurityException {
+        byte[] salt = new byte[16];
+        PASSWORD_RANDOM.nextBytes(salt);
+        javax.crypto.spec.PBEKeySpec spec = new javax.crypto.spec.PBEKeySpec(
+                password.toCharArray(), salt, PASSWORD_ITERATIONS, PASSWORD_KEY_LENGTH);
+        try {
+            byte[] hash = javax.crypto.SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
+                    .generateSecret(spec).getEncoded();
+            return "pbkdf2_sha256$" + PASSWORD_ITERATIONS + "$"
+                    + java.util.Base64.getEncoder().encodeToString(salt) + "$"
+                    + java.util.Base64.getEncoder().encodeToString(hash);
+        } finally {
+            spec.clearPassword();
+        }
+    }
+
+    private static boolean verifyPassword(String password, String stored)
+            throws java.security.GeneralSecurityException {
+        if (stored == null) return false;
+        if (!stored.startsWith("pbkdf2_sha256$")) {
+            // Backward compatibility: a successful legacy login is re-hashed immediately.
+            return java.security.MessageDigest.isEqual(
+                    password.getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                    stored.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        }
+        String[] parts = stored.split("\\$");
+        if (parts.length != 4) return false;
+        int iterations = Integer.parseInt(parts[1]);
+        if (iterations < 100_000 || iterations > 2_000_000) return false;
+        byte[] salt = java.util.Base64.getDecoder().decode(parts[2]);
+        byte[] expected = java.util.Base64.getDecoder().decode(parts[3]);
+        javax.crypto.spec.PBEKeySpec spec = new javax.crypto.spec.PBEKeySpec(
+                password.toCharArray(), salt, iterations, expected.length * 8);
+        try {
+            byte[] actual = javax.crypto.SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
+                    .generateSecret(spec).getEncoded();
+            return java.security.MessageDigest.isEqual(expected, actual);
+        } finally {
+            spec.clearPassword();
+        }
+    }
+
+    private void disableDefaultDemoAccount(Connection c) throws SQLException, java.security.GeneralSecurityException {
+        try (PreparedStatement check = c.prepareStatement(
+                "SELECT id,password FROM users WHERE username=?")) {
+            check.setString(1, "admin");
+            try (ResultSet rs = check.executeQuery()) {
+                if (rs.next() && "admin123".equals(rs.getString("password"))) {
+                    // Disable the predictable sample credential without deleting its related records.
+                    String unusablePassword = java.util.UUID.randomUUID().toString();
+                    try (PreparedStatement update = c.prepareStatement(
+                            "UPDATE users SET password=? WHERE id=?")) {
+                        update.setString(1, hashPassword(unusablePassword));
+                        update.setInt(2, rs.getInt("id"));
+                        update.executeUpdate();
+                    }
+                    LOG.warning("Disabled the old default demo admin account. Create a new account to continue.");
+                }
+            }
+        }
     }
 
     private void chkMatch(PasswordField p, PasswordField c, Label l) {
